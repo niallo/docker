@@ -1,5 +1,5 @@
 {
-    "prepare":"make",
-    "test":"go test",
+    "prepare":"GOROOT=/opt/node/go GOBIN=/opt/node/bin/go make",
+    "test":"GOROOT=/opt/node/go GOBIN=go test",
     "deploy":"echo a custom docker deploy"
 }

@@ -1,0 +1,5 @@
+{
+    "prepare":"make",
+    "test":"go test",
+    "deploy":"echo a custom docker deploy"
+}

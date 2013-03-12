@@ -19,3 +19,7 @@ docker.o: env deps
 
 dockerd.o: env deps
 	GOPATH=${GOPATH} go build -o ${BUILDPATH}/dockerd dockerd/dockerd.go
+
+test:
+	GOPATH=${GOPATH} go test
+

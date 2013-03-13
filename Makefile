@@ -8,7 +8,7 @@ env:
 	ln -s $(PWD) ${GOPATH}/src/github.com/dotcloud/docker
 
 deps:
-	GOPATH=${GOPATH} go get github.com/kr/pty
+	GOPATH=${GOPATH} go get
 
 clean:
 	go clean

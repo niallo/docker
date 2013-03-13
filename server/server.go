@@ -1,15 +1,15 @@
 package server
 
 import (
+	".."
+	"../fs"
+	"../future"
+	"../rcli"
 	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/dotcloud/docker"
-	"github.com/dotcloud/docker/future"
-	"github.com/dotcloud/docker/image"
-	"github.com/dotcloud/docker/rcli"
 	"io"
 	"net/http"
 	"net/url"
@@ -41,6 +41,9 @@ func (srv *Server) Name() string {
 func (srv *Server) Help() string {
 	help := "Usage: docker COMMAND [arg...]\n\nA self-sufficient runtime for linux containers.\n\nCommands:\n"
 	for _, cmd := range [][]interface{}{
+		{"run", "Run a command in a container"},
+		{"ps", "Display a list of containers"},
+		{"import", "Create a new filesystem image from the contents of a tarball"},
 		{"attach", "Attach to a running container"},
 		{"cat", "Write the contents of a container's file to standard output"},
 		{"commit", "Create a new image from a container's changes"},
@@ -99,18 +102,25 @@ func (srv *Server) CmdWait(stdin io.ReadCloser, stdout io.Writer, args ...string
 
 // 'docker info': display system-wide information.
 func (srv *Server) CmdInfo(stdin io.ReadCloser, stdout io.Writer, args ...string) error {
+	images, _ := srv.images.Images()
+	var imgcount int
+	if images == nil {
+		imgcount = 0
+	} else {
+		imgcount = len(images)
+	}
 	cmd := rcli.Subcmd(stdout, "info", "", "Display system-wide information.")
 	if err := cmd.Parse(args); err != nil {
 		return nil
 	}
-	if cmd.NArg() > 1 {
+	if cmd.NArg() > 0 {
 		cmd.Usage()
 		return nil
 	}
 	fmt.Fprintf(stdout, "containers: %d\nversion: %s\nimages: %d\n",
 		len(srv.containers.List()),
 		VERSION,
-		len(srv.images.ById))
+		imgcount)
 	return nil
 }
 
@@ -191,7 +201,7 @@ func (srv *Server) CmdUmount(stdin io.ReadCloser, stdout io.Writer, args ...stri
 	}
 	for _, name := range cmd.Args() {
 		if container := srv.containers.Get(name); container != nil {
-			if err := container.Filesystem.Umount(); err != nil {
+			if err := container.Mountpoint.Umount(); err != nil {
 				return err
 			}
 			fmt.Fprintln(stdout, container.Id)
@@ -213,7 +223,7 @@ func (srv *Server) CmdMount(stdin io.ReadCloser, stdout io.Writer, args ...strin
 	}
 	for _, name := range cmd.Args() {
 		if container := srv.containers.Get(name); container != nil {
-			if err := container.Filesystem.Mount(); err != nil {
+			if err := container.Mountpoint.EnsureMounted(); err != nil {
 				return err
 			}
 			fmt.Fprintln(stdout, container.Id)
@@ -235,7 +245,7 @@ func (srv *Server) CmdCat(stdin io.ReadCloser, stdout io.Writer, args ...string)
 	}
 	name, path := cmd.Arg(0), cmd.Arg(1)
 	if container := srv.containers.Get(name); container != nil {
-		if f, err := container.Filesystem.OpenFile(path, os.O_RDONLY, 0); err != nil {
+		if f, err := container.Mountpoint.OpenFile(path, os.O_RDONLY, 0); err != nil {
 			return err
 		} else if _, err := io.Copy(stdout, f); err != nil {
 			return err
@@ -256,7 +266,7 @@ func (srv *Server) CmdWrite(stdin io.ReadCloser, stdout io.Writer, args ...strin
 	}
 	name, path := cmd.Arg(0), cmd.Arg(1)
 	if container := srv.containers.Get(name); container != nil {
-		if f, err := container.Filesystem.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0600); err != nil {
+		if f, err := container.Mountpoint.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0600); err != nil {
 			return err
 		} else if _, err := io.Copy(f, stdin); err != nil {
 			return err
@@ -277,7 +287,7 @@ func (srv *Server) CmdLs(stdin io.ReadCloser, stdout io.Writer, args ...string) 
 	}
 	name, path := cmd.Arg(0), cmd.Arg(1)
 	if container := srv.containers.Get(name); container != nil {
-		if files, err := container.Filesystem.ReadDir(path); err != nil {
+		if files, err := container.Mountpoint.ReadDir(path); err != nil {
 			return err
 		} else {
 			for _, f := range files {
@@ -302,8 +312,8 @@ func (srv *Server) CmdInspect(stdin io.ReadCloser, stdout io.Writer, args ...str
 	var obj interface{}
 	if container := srv.containers.Get(name); container != nil {
 		obj = container
-	} else if image := srv.images.Find(name); image != nil {
-		obj = image
+		//} else if image, err := srv.images.List(name); image != nil {
+		//	obj = image
 	} else {
 		return errors.New("No such container or image: " + name)
 	}
@@ -345,33 +355,34 @@ func (srv *Server) CmdPort(stdin io.ReadCloser, stdout io.Writer, args ...string
 }
 
 // 'docker rmi NAME' removes all images with the name NAME
-func (srv *Server) CmdRmi(stdin io.ReadCloser, stdout io.Writer, args ...string) error {
-	cmd := rcli.Subcmd(stdout, "rmimage", "[OPTIONS] IMAGE", "Remove an image")
-	fl_regexp := cmd.Bool("r", false, "Use IMAGE as a regular expression instead of an exact name")
-	if err := cmd.Parse(args); err != nil {
-		return nil
-	}
-	if cmd.NArg() < 1 {
-		cmd.Usage()
-		return nil
-	}
-	for _, name := range cmd.Args() {
-		var err error
-		if *fl_regexp {
-			err = srv.images.DeleteMatch(name)
-		} else {
-			image := srv.images.Find(name)
-			if image == nil {
-				return errors.New("No such image: " + name)
-			}
-			err = srv.images.Delete(name)
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
+// func (srv *Server) CmdRmi(stdin io.ReadCloser, stdout io.Writer, args ...string) error {
+// 	cmd := rcli.Subcmd(stdout, "rmimage", "[OPTIONS] IMAGE", "Remove an image")
+// 	fl_regexp := cmd.Bool("r", false, "Use IMAGE as a regular expression instead of an exact name")
+// 	if err := cmd.Parse(args); err != nil {
+// 		cmd.Usage()
+// 		return nil
+// 	}
+// 	if cmd.NArg() < 1 {
+// 		cmd.Usage()
+// 		return nil
+// 	}
+// 	for _, name := range cmd.Args() {
+// 		var err error
+// 		if *fl_regexp {
+// 			err = srv.images.DeleteMatch(name)
+// 		} else {
+// 			image := srv.images.Find(name)
+// 			if image == nil {
+// 				return errors.New("No such image: " + name)
+// 			}
+// 			err = srv.images.Delete(name)
+// 		}
+// 		if err != nil {
+// 			return err
+// 		}
+// 	}
+// 	return nil
+// }
 
 func (srv *Server) CmdRm(stdin io.ReadCloser, stdout io.Writer, args ...string) error {
 	cmd := rcli.Subcmd(stdout, "rm", "[OPTIONS] CONTAINER", "Remove a container")
@@ -408,57 +419,46 @@ func (srv *Server) CmdKill(stdin io.ReadCloser, stdout io.Writer, args ...string
 	return nil
 }
 
-func (srv *Server) CmdPull(stdin io.ReadCloser, stdout io.Writer, args ...string) error {
-	cmd := rcli.Subcmd(stdout, "pull", "[OPTIONS] NAME", "Download a new image from a remote location")
+func (srv *Server) CmdImport(stdin io.ReadCloser, stdout io.Writer, args ...string) error {
+	cmd := rcli.Subcmd(stdout, "import", "[OPTIONS] NAME", "Create a new filesystem image from the contents of a tarball")
+	fl_stdin := cmd.Bool("stdin", false, "Read tarball from stdin")
 	if err := cmd.Parse(args); err != nil {
 		return nil
 	}
+	var archive io.Reader
 	name := cmd.Arg(0)
 	if name == "" {
 		return errors.New("Not enough arguments")
 	}
-	u, err := url.Parse(name)
-	if err != nil {
-		return err
-	}
-	if u.Scheme == "" {
-		u.Scheme = "http"
-	}
-	// FIXME: hardcode a mirror URL that does not depend on a single provider.
-	if u.Host == "" {
-		u.Host = "s3.amazonaws.com"
-		u.Path = path.Join("/docker.io/images", u.Path)
-	}
-	fmt.Fprintf(stdout, "Downloading from %s\n", u.String())
-	// Download with curl (pretty progress bar)
-	// If curl is not available, fallback to http.Get()
-	archive, err := future.Curl(u.String(), stdout)
-	if err != nil {
-		if resp, err := http.Get(u.String()); err != nil {
+	if *fl_stdin {
+		archive = stdin
+	} else {
+		u, err := url.Parse(name)
+		if err != nil {
 			return err
-		} else {
-			archive = resp.Body
+		}
+		if u.Scheme == "" {
+			u.Scheme = "http"
+		}
+		// FIXME: hardcode a mirror URL that does not depend on a single provider.
+		if u.Host == "" {
+			u.Host = "s3.amazonaws.com"
+			u.Path = path.Join("/docker.io/images", u.Path)
+		}
+		fmt.Fprintf(stdout, "Downloading from %s\n", u.String())
+		// Download with curl (pretty progress bar)
+		// If curl is not available, fallback to http.Get()
+		archive, err = future.Curl(u.String(), stdout)
+		if err != nil {
+			if resp, err := http.Get(u.String()); err != nil {
+				return err
+			} else {
+				archive = resp.Body
+			}
 		}
 	}
 	fmt.Fprintf(stdout, "Unpacking to %s\n", name)
-	img, err := srv.images.Import(name, archive, nil)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(stdout, img.Id)
-	return nil
-}
-
-func (srv *Server) CmdPut(stdin io.ReadCloser, stdout io.Writer, args ...string) error {
-	cmd := rcli.Subcmd(stdout, "put", "[OPTIONS] NAME", "Import a new image from a local archive.")
-	if err := cmd.Parse(args); err != nil {
-		return nil
-	}
-	name := cmd.Arg(0)
-	if name == "" {
-		return errors.New("Not enough arguments")
-	}
-	img, err := srv.images.Import(name, stdin, nil)
+	img, err := srv.images.Create(archive, nil, name, "")
 	if err != nil {
 		return err
 	}
@@ -485,23 +485,27 @@ func (srv *Server) CmdImages(stdin io.ReadCloser, stdout io.Writer, args ...stri
 	if !*quiet {
 		fmt.Fprintf(w, "NAME\tID\tCREATED\tPARENT\n")
 	}
-	for _, name := range srv.images.Names() {
+	paths, err := srv.images.Paths()
+	if err != nil {
+		return err
+	}
+	for _, name := range paths {
 		if nameFilter != "" && nameFilter != name {
 			continue
 		}
-		for idx, img := range *srv.images.ByName[name] {
+		ids, err := srv.images.List(name)
+		if err != nil {
+			return err
+		}
+		for idx, img := range ids {
 			if *limit > 0 && idx >= *limit {
 				break
 			}
 			if !*quiet {
-				id := img.Id
-				if !img.IdIsFinal() {
-					id += "..."
-				}
 				for idx, field := range []string{
 					/* NAME */ name,
-					/* ID */ id,
-					/* CREATED */ future.HumanDuration(time.Now().Sub(img.Created)) + " ago",
+					/* ID */ img.Id,
+					/* CREATED */ future.HumanDuration(time.Now().Sub(time.Unix(img.Created, 0))) + " ago",
 					/* PARENT */ img.Parent,
 				} {
 					if idx == 0 {
@@ -578,7 +582,7 @@ func (srv *Server) CmdLayers(stdin io.ReadCloser, stdout io.Writer, args ...stri
 	if err := cmd.Parse(args); err != nil {
 		return nil
 	}
-	for _, layer := range srv.images.Layers.List() {
+	for _, layer := range srv.images.Layers() {
 		fmt.Fprintln(stdout, layer)
 	}
 	return nil
@@ -591,10 +595,16 @@ func (srv *Server) CmdCp(stdin io.ReadCloser, stdout io.Writer, args ...string) 
 	if err := cmd.Parse(args); err != nil {
 		return nil
 	}
-	if newImage, err := srv.images.Copy(cmd.Arg(0), cmd.Arg(1)); err != nil {
+	if image, err := srv.images.Get(cmd.Arg(0)); err != nil {
 		return err
+	} else if image == nil {
+		return errors.New("Image " + cmd.Arg(0) + " does not exist")
 	} else {
-		fmt.Fprintln(stdout, newImage.Id)
+		if img, err := image.Copy(cmd.Arg(1)); err != nil {
+			return err
+		} else {
+			fmt.Fprintln(stdout, img.Id)
+		}
 	}
 	return nil
 }
@@ -613,16 +623,21 @@ func (srv *Server) CmdCommit(stdin io.ReadCloser, stdout io.Writer, args ...stri
 	}
 	if container := srv.containers.Get(containerName); container != nil {
 		// FIXME: freeze the container before copying it to avoid data corruption?
-		rwTar, err := image.Tar(container.Filesystem.RWPath, image.Uncompressed)
+		rwTar, err := fs.Tar(container.Mountpoint.Rw, fs.Uncompressed)
 		if err != nil {
 			return err
 		}
 		// Create a new image from the container's base layers + a new layer from container changes
-		parentImg := srv.images.Find(container.GetUserData("image"))
-		img, err := srv.images.Import(imgName, rwTar, parentImg)
+		parentImg, err := srv.images.Get(container.Image)
 		if err != nil {
 			return err
 		}
+
+		img, err := srv.images.Create(rwTar, parentImg, imgName, "")
+		if err != nil {
+			return err
+		}
+
 		fmt.Fprintln(stdout, img.Id)
 		return nil
 	}
@@ -642,7 +657,10 @@ func (srv *Server) CmdTar(stdin io.ReadCloser, stdout io.Writer, args ...string)
 	}
 	name := cmd.Arg(0)
 	if container := srv.containers.Get(name); container != nil {
-		data, err := container.Filesystem.Tar()
+		if err := container.Mountpoint.EnsureMounted(); err != nil {
+			return err
+		}
+		data, err := fs.Tar(container.Mountpoint.Root, fs.Uncompressed)
 		if err != nil {
 			return err
 		}
@@ -668,7 +686,7 @@ func (srv *Server) CmdDiff(stdin io.ReadCloser, stdout io.Writer, args ...string
 	if container := srv.containers.Get(cmd.Arg(0)); container == nil {
 		return errors.New("No such container")
 	} else {
-		changes, err := container.Filesystem.Changes()
+		changes, err := srv.images.Changes(container.Mountpoint)
 		if err != nil {
 			return err
 		}
@@ -691,7 +709,7 @@ func (srv *Server) CmdReset(stdin io.ReadCloser, stdout io.Writer, args ...strin
 	}
 	for _, name := range cmd.Args() {
 		if container := srv.containers.Get(name); container != nil {
-			if err := container.Filesystem.Reset(); err != nil {
+			if err := container.Mountpoint.Reset(); err != nil {
 				return errors.New("Reset " + container.Id + ": " + err.Error())
 			}
 		}
@@ -721,10 +739,9 @@ func (srv *Server) CmdLogs(stdin io.ReadCloser, stdout io.Writer, args ...string
 	return errors.New("No such container: " + cmd.Arg(0))
 }
 
-func (srv *Server) CreateContainer(img *image.Image, ports []int, user string,
-	tty bool, openStdin bool, memory int64, comment string, cmd string, args ...string) (*docker.Container, error) {
+func (srv *Server) CreateContainer(img *fs.Image, ports []int, user string, tty bool, openStdin bool, memory int64, comment string, cmd string, args ...string) (*docker.Container, error) {
 	id := future.RandomId()[:8]
-	container, err := srv.containers.Create(id, cmd, args, img.Layers,
+	container, err := srv.containers.Create(id, cmd, args, img,
 		&docker.Config{
 			Hostname:  id,
 			Ports:     ports,
@@ -839,8 +856,10 @@ func (srv *Server) CmdRun(stdin io.ReadCloser, stdout io.Writer, args ...string)
 		cmdline = []string{"/bin/bash", "-i"}
 	}
 	// Find the image
-	img := srv.images.Find(name)
-	if img == nil {
+	img, err := srv.images.Find(name)
+	if err != nil {
+		return err
+	} else if img == nil {
 		return errors.New("No such image: " + name)
 	}
 	// Create new container
@@ -903,16 +922,15 @@ func (srv *Server) CmdRun(stdin io.ReadCloser, stdout io.Writer, args ...string)
 
 func New() (*Server, error) {
 	future.Seed()
-	images, err := image.New("/var/lib/docker/images")
-	if err != nil {
-		return nil, err
-	}
+	// if err != nil {
+	// 	return nil, err
+	// }
 	containers, err := docker.New()
 	if err != nil {
 		return nil, err
 	}
 	srv := &Server{
-		images:	 images,
+		images:     containers.Store,
 		containers: containers,
 	}
 	return srv, nil
@@ -959,5 +977,5 @@ func (srv *Server) CmdWeb(stdin io.ReadCloser, stdout io.Writer, args ...string)
 
 type Server struct {
 	containers *docker.Docker
-	images     *image.Store
+	images     *fs.Store
 }
